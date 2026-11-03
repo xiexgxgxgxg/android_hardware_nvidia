@@ -1,11 +1,18 @@
-// Legacy atomics for pre-Android-7 Tegra blobs (hwcomposer.tegra, gralloc.tegra).
+// Legacy compatibility shims for pre-Android-7 Tegra blobs.
 cc_library_shared {
     name: "libshim_atomic",
-    srcs: ["shim_atomic.c"],
+    srcs: [
+        "shim_atomic.c",
+        "shim_graphicbuffer.cpp",
+    ],
+    shared_libs: [
+        "libui",
+    ],
     cflags: [
         "-fno-builtin",
-        // Soong hides symbols by default; the blobs dlopen into the
-        // composer service and need these in the dynamic symbol table.
+        // Soong hides symbols by default; the blobs dlopen later and need
+        // these in the dynamic symbol table.
         "-fvisibility=default",
     ],
+    cppflags: ["-std=c++14"],
 }
