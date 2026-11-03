@@ -31,11 +31,3 @@ LOCAL_SHARED_LIBRARIES := libcutils
 LOCAL_MODULE_TAGS := optional
 include $(BUILD_SHARED_LIBRARY)
 
-
-include $(CLEAR_VARS)
-LOCAL_SRC_FILES := shim_atomic.c
-LOCAL_MODULE := libshim_atomic
-LOCAL_MODULE_TAGS := optional
-LOCAL_VENDOR_MODULE := true
-LOCAL_CFLAGS += -fno-builtin
-include $(BUILD_SHARED_LIBRARY)
