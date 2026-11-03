@@ -1,0 +1,4 @@
+service vendor.gralloc-2-0 /vendor/bin/hw/android.hardware.graphics.mapper@2.0-service
+    class hal
+    user system
+    group graphics
