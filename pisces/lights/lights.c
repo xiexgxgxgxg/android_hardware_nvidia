@@ -20,6 +20,7 @@
 #include <cutils/log.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -136,6 +137,7 @@ static int set_light_buttons(struct light_device_t* dev, struct light_state_t co
 
 static int set_speaker_light_locked(struct light_device_t* dev, struct light_state_t const* state)
 {
+	(void)dev;
 	dump_light_state("attention",    &g_attention);
 	dump_light_state("notification", &g_notification);
 	dump_light_state("battery",      &g_battery);
