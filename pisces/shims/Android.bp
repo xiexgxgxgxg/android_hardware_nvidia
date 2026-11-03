@@ -1,7 +1,6 @@
 // Legacy atomics for pre-Android-7 Tegra blobs (hwcomposer.tegra, gralloc.tegra).
 cc_library_shared {
     name: "libshim_atomic",
-    vendor: true,
     srcs: ["shim_atomic.c"],
     cflags: [
         "-fno-builtin",
