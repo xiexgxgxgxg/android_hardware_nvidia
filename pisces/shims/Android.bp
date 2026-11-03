@@ -3,5 +3,10 @@ cc_library_shared {
     name: "libshim_atomic",
     vendor: true,
     srcs: ["shim_atomic.c"],
-    cflags: ["-fno-builtin"],
+    cflags: [
+        "-fno-builtin",
+        // Soong hides symbols by default; the blobs dlopen into the
+        // composer service and need these in the dynamic symbol table.
+        "-fvisibility=default",
+    ],
 }
