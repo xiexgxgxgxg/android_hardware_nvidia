@@ -775,6 +775,24 @@ static int camera_device_close(hw_device_t *device)
     usleep(300000);
     closeLeakedVendorFds();
 
+    /*
+     * The vendor HAL cannot serve a second sensor in the same process: after
+     * one camera session the next one opens but its CSI never delivers frames
+     * (sync point 15 timeout, black then green preview), in *both* directions.
+     * The same sensor always works as the first session of a process, so
+     * restart the provider after every close; the camera service retries the
+     * next open while the fresh provider registers.  set_parameters() is
+     * asynchronous and each sensor's parameter blob is cached, so the
+     * framework is not blocked or misconfigured during the switch.
+     */
+    {
+        pid_t child = fork();
+        if (child == 0) {
+            execl("/system/bin/sh", "sh", "-c", "kill -9 $PPID", (char *)NULL);
+            _exit(0);
+        }
+    }
+
     if (wrapper_dev->base.ops)
         delete wrapper_dev->base.ops;
     delete wrapper_dev;
@@ -1017,7 +1035,9 @@ static int camera_get_camera_info(int camera_id, struct camera_info *info)
     }
     memset(info, 0, sizeof(*info));
     info->facing = (camera_id == 0) ? CAMERA_FACING_BACK : CAMERA_FACING_FRONT;
-    info->orientation = (camera_id == 0) ? 90 : 270;
+    /* The front module is mounted 180 degrees from what nvcamera.conf claims
+     * (270); with 270 the preview came out upside down. */
+    info->orientation = (camera_id == 0) ? 90 : 90;
     info->device_version = CAMERA_DEVICE_API_VERSION_1_0;
     info->static_camera_characteristics = NULL;
     info->resource_cost = 0;
