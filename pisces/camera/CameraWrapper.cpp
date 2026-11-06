@@ -626,15 +626,22 @@ static int camera_device_close(hw_device_t *device)
     unloadVendorModule();
 
     /*
-     * The vendor HAL tears its module-global state down asynchronously (focus
-     * motor "NvFmInitialize: Failed already initialized", NvMM block
-     * container, VI/CSI bookkeeping): the next camera open in this process
-     * raced that teardown and failed with 0xd (green preview when switching to
-     * the front sensor).  Give the teardown a moment before returning the
-     * close to the framework - the app's next open then starts from a clean
-     * HAL state without having to restart the whole provider.
+     * The vendor HAL never fully resets its module-global state (focus motor
+     * "NvFmInitialize: Failed already initialized", NvMM block container,
+     * VI/CSI routing for the previous sensor).  A rear->front switch opened
+     * the front sensor but its CSI never produced frames (sync point 15
+     * timeout, black then green preview), while the same front sensor streams
+     * fine as the first session of a process.  So restart the provider after
+     * every camera close: init brings the service back and the camera service
+     * retries the next open until the fresh provider registers.
      */
-    usleep(400000);
+    {
+        pid_t child = fork();
+        if (child == 0) {
+            execl("/system/bin/sh", "sh", "-c", "sleep 0.15; kill -9 $PPID", (char *)NULL);
+            _exit(0);
+        }
+    }
     if (wrapper_dev->base.ops)
         delete wrapper_dev->base.ops;
     delete wrapper_dev;
