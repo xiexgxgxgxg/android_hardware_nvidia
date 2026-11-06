@@ -1,0 +1,19 @@
+// Minimal ALSA-backed audio HAL for pisces (see audio_hw_pisces.c).
+cc_library_shared {
+    name: "audio.primary.pisces",
+    srcs: [
+        "audio_hw_pisces.c",
+    ],
+    vendor: true,
+    relative_install_path: "hw",
+    cflags: [
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+    ],
+    shared_libs: [
+        "libcutils",
+        "libhardware",
+        "liblog",
+        "libtinyalsa",
+    ],
+}

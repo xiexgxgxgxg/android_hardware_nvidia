@@ -1,0 +1,18 @@
+// android.hardware.usb.gadget@1.0 implemented on top of the legacy android_usb
+// sysfs interface (this kernel has no configfs gadget).
+cc_binary {
+    name: "android.hardware.usb.gadget@1.0-service.pisces",
+    init_rc: ["android.hardware.usb.gadget@1.0-service.pisces.rc"],
+    vendor: true,
+    relative_install_path: "hw",
+    srcs: ["usbgadget.cpp"],
+    shared_libs: [
+        "android.hardware.usb.gadget@1.0",
+        "libbase",
+        "libcutils",
+        "libhidlbase",
+        "libhidltransport",
+        "liblog",
+        "libutils",
+    ],
+}

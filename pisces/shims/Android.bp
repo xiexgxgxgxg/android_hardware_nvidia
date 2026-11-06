@@ -6,6 +6,7 @@ cc_library_shared {
         "shim_graphicbuffer.cpp",
     ],
     shared_libs: [
+        "libcutils",
         "libui",
     ],
     cflags: [
@@ -15,4 +16,39 @@ cc_library_shared {
         "-fvisibility=default",
     ],
     cppflags: ["-std=c++14"],
+}
+
+// The 2013 tegra camera HAL needs the Android 4.x SensorManager entry points.
+// LD_PRELOADed into the camera provider so the vendor module can resolve them
+// (hw_get_module loads it in a linker namespace where RTLD_GLOBAL does not
+// reach).  It forwards to the real Android 9 SensorManager/SensorEventQueue.
+cc_library_shared {
+    name: "libpisces_camshim",
+    srcs: [
+        "camshim.cpp",
+    ],
+    cflags: [
+        "-fvisibility=default",
+        "-fno-builtin",
+    ],
+    cppflags: ["-std=c++14"],
+    shared_libs: [
+        "libbase",
+        "libcutils",
+        "libdl",
+        "libsensor",
+        "libutils",
+    ],
+}
+
+// Spreadtrum RIL blob needs the pre-M libcutils socket_loopback_client().
+cc_library_shared {
+    name: "libpisces_rilshim",
+    srcs: [
+        "rishim.c",
+    ],
+    cflags: [
+        "-fvisibility=default",
+        "-fno-builtin",
+    ],
 }

@@ -28,6 +28,7 @@
 #include <cutils/log.h>
 
 #include <utils/threads.h>
+#include <dlfcn.h>
 #include <utils/String8.h>
 #include <hardware/hardware.h>
 #include <hardware/camera.h>
@@ -39,7 +40,7 @@
 
 #include <binder/IBinder.h>
 #include <binder/IServiceManager.h>
-#include <gui/ISensorServer.h>
+#include <sensor/ISensorServer.h>
 
 static android::Mutex gCameraWrapperLock;
 
@@ -84,23 +85,58 @@ static inline wrapper_camera_device_t *toWrapper(void *device)
     return reinterpret_cast<wrapper_camera_device_t *>(device);
 }
 
+/*
+ * pisces: the 2013 HAL never resets its global state (focuser module, NvMM
+ * block container, VI/CSI bookkeeping) when a camera is closed.  The next
+ * open - switching from the rear to the front camera, or simply reopening the
+ * app - then fails with 0xd / 0x30012, and the preview shows uninitialised
+ * buffers (the green screen).  Because this wrapper dlopen()s the vendor
+ * module itself, it can drop it again after every close: the next
+ * camera_device_open() reloads /vendor/lib/hw/camera.vendor.tegra.so with
+ * fresh globals, which is exactly the clean state a fresh provider process
+ * has.
+ */
+static void *gVendorHandle = NULL;
+
 static camera_module_t *loadVendorModule()
 {
     ALOGV("%s", __FUNCTION__);
 
+    // pisces: the blob was linked against the Android 4.x SensorManager that
+    // used to live in libgui.  Put the ABI stubs into the global symbol scope
+    // before dlopen()ing the vendor module, otherwise the loader aborts with
+    // "cannot locate symbol _ZN7android9SingletonINS_13SensorManagerEE5sLockE".
+    void *shim = dlopen("/system/lib/libpisces_camshim.so", RTLD_NOW | RTLD_GLOBAL);
+    if (shim == NULL)
+        ALOGW("camera ABI shim not loaded: %s", dlerror());
+
+    // Load the vendor module ourselves: hw_get_module_by_class() goes through
+    // android_load_sphal_library(), which loads it in a different linker
+    // namespace where the shim symbols above are not visible.
+    void *handle = dlopen("/vendor/lib/hw/camera.vendor.tegra.so", RTLD_NOW);
+    if (handle == NULL)
+        ALOGE("failed to dlopen vendor camera module: %s", dlerror());
+    else
+        gVendorHandle = handle;
+
     camera_module_t *module = NULL;
-    int rv = hw_get_module_by_class("camera", "vendor",
-            (const hw_module_t**)&module);
-    if (rv)
-        ALOGE("failed to load vendor camera module: %d", rv);
+    if (handle != NULL) {
+        module = (camera_module_t *)dlsym(handle, HAL_MODULE_INFO_SYM_AS_STR);
+        if (module == NULL)
+            ALOGE("failed to find camera module info: %s", dlerror());
+    }
 
     return module;
 }
 
+static camera_module_t *gVendorModule = NULL;
+
 static camera_module_t *getVendorModule()
 {
-    static camera_module_t *vendorModule = loadVendorModule();
-    return vendorModule;
+    if (gVendorModule == NULL) {
+        gVendorModule = loadVendorModule();
+    }
+    return gVendorModule;
 }
 
 static char *camera_fixup_getparams(wrapper_camera_device_t *wrapper __attribute__((unused)),
@@ -465,6 +501,38 @@ static char *camera_get_parameters(struct camera_device *device)
     char *params = VENDOR_CALL(device, get_parameters);
     char *fixed_params = camera_fixup_getparams(toWrapper(device), params);
     VENDOR_CALL(device, put_parameters, params);
+
+    /*
+     * pisces: after a provider restart (the wrapper kills the provider on
+     * every close so the next session starts from clean HAL state) the first
+     * get_parameters() can race the HAL's initialisation and come back empty.
+     * Snap then dies with "getParameters failed (empty parameters)" right
+     * after a rear<->front switch.  Fall back to the parameter blob captured
+     * from a working session (the same file the camera service uses for the
+     * legacy shim) instead of handing the framework an empty string.
+     */
+    if (fixed_params == NULL || fixed_params[0] == '\0') {
+        static char *cached_params = NULL;
+        if (cached_params == NULL) {
+            FILE *f = fopen("/data/misc/cameraserver/pisces_shim_params.txt", "re");
+            if (f != NULL) {
+                static char buf[4096];
+                size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+                fclose(f);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    cached_params = strdup(buf);
+                }
+            }
+        }
+        if (cached_params != NULL && cached_params[0] != '\0') {
+            ALOGW("vendor returned empty parameters, using the cached blob");
+            if (fixed_params != NULL) {
+                free(fixed_params);
+            }
+            return strdup(cached_params);
+        }
+    }
     return fixed_params;
 }
 
@@ -515,6 +583,24 @@ static int camera_dump(struct camera_device *device, int fd)
 
 extern "C" void heaptracker_free_leaked_memory(void);
 
+// pisces: the 2013 tegra HAL can be opened exactly once per camera: its close
+// path double-releases a refcount and aborts the provider.  The framework opens
+// the camera during enumeration (to read SUPPORTED_FLASH_MODES) and then again
+// when an app connects, so keep one vendor device per camera id and reuse it.
+static camera_device_t *gVendorDevices[4] = { NULL, NULL, NULL, NULL };
+
+/* Drop the vendor module so the next open reloads it with fresh globals.  See
+ * the comment at gVendorHandle. */
+static void unloadVendorModule()
+{
+    if (gVendorHandle != NULL) {
+        ALOGI("unloading vendor camera module to reset its state");
+        dlclose(gVendorHandle);
+        gVendorHandle = NULL;
+    }
+    gVendorModule = NULL;
+}
+
 static int camera_device_close(hw_device_t *device)
 {
     wrapper_camera_device_t *wrapper_dev = reinterpret_cast<wrapper_camera_device_t *>(device);
@@ -530,6 +616,25 @@ static int camera_device_close(hw_device_t *device)
     }
 
     wrapper_dev->vendor->common.close((hw_device_t*)wrapper_dev->vendor);
+    // note: the vendor device is not reusable after close; drop it from the cache
+    for (size_t i = 0; i < sizeof(gVendorDevices) / sizeof(gVendorDevices[0]); i++) {
+        if (gVendorDevices[i] == wrapper_dev->vendor) {
+            gVendorDevices[i] = NULL;
+        }
+    }
+    /* pisces: force the next open to reload the HAL from scratch */
+    unloadVendorModule();
+
+    /*
+     * The vendor HAL tears its module-global state down asynchronously (focus
+     * motor "NvFmInitialize: Failed already initialized", NvMM block
+     * container, VI/CSI bookkeeping): the next camera open in this process
+     * raced that teardown and failed with 0xd (green preview when switching to
+     * the front sensor).  Give the teardown a moment before returning the
+     * close to the framework - the app's next open then starts from a clean
+     * HAL state without having to restart the whole provider.
+     */
+    usleep(400000);
     if (wrapper_dev->base.ops)
         delete wrapper_dev->base.ops;
     delete wrapper_dev;
@@ -550,6 +655,27 @@ done:
  * so this function will always only be called once per camera instance
  */
 
+static camera_device_t *openVendorDeviceLocked(int id, const char *name)
+{
+    if (id < 0 || id >= (int)(sizeof(gVendorDevices) / sizeof(gVendorDevices[0])))
+        return NULL;
+
+    if (gVendorDevices[id] != NULL) {
+        ALOGW("reusing vendor camera %d (single-open HAL)", id);
+        return gVendorDevices[id];
+    }
+
+    camera_device_t *dev = NULL;
+    int rv = getVendorModule()->common.methods->open(
+            (const hw_module_t*)getVendorModule(), name, (hw_device_t**)&dev);
+    if (rv != 0 || dev == NULL) {
+        ALOGE("vendor camera open failed for %s: %d", name, rv);
+        return NULL;
+    }
+    gVendorDevices[id] = dev;
+    return dev;
+}
+
 static int camera_device_open(const hw_module_t *module, const char *name,
         hw_device_t **device)
 {
@@ -566,7 +692,10 @@ static int camera_device_open(const hw_module_t *module, const char *name,
     }
 
     int cameraid = atoi(name);
-    int num_cameras = getVendorModule()->get_number_of_cameras();
+    /* pisces: rear (0) and front (1); see camera_get_number_of_cameras().
+     * Do not call the vendor here - its get_number_of_cameras() probes the
+     * sensors and claims the imager. */
+    int num_cameras = 2;
     ALOGI("camera count = %d", num_cameras);
 
     int rv = 0;
@@ -594,26 +723,21 @@ static int camera_device_open(const hw_module_t *module, const char *name,
         using namespace android;
         const String16 sensorServiceName("sensorservice");
         sp<ISensorServer> sensorServer;
-        for (int i = 0; i < 60; i++) {
-            status_t err = getService(sensorServiceName, &sensorServer);
-            if (err == NAME_NOT_FOUND) {
-                ALOGI("Waiting for sensorservice ...");
-                sleep(1);
-                continue;
-            }
-            if (err != NO_ERROR) {
-                return err;
-            }
-            break;
-        }
+        // pisces: there is no sensors HAL on this device yet, and the sensor
+        // entry points the blob calls are stubbed by libpisces_camshim, so a
+        // short bounded wait is enough.  Waiting for the binder service here
+        // blocked camera provider start-up for minutes.
+        // pisces: no sensors HAL exists on this device and libpisces_camshim
+        // stubs every sensor entry point the blob uses, so do not wait at all.
+        // Each binder lookup here blocked for ~6 s.
+        (void)sensorServer;
     }
 
     ALOGV("calling vendor camera_device_open ...");
-    rv = getVendorModule()->common.methods->open(
-            (const hw_module_t*)getVendorModule(), name,
-            (hw_device_t**)&(camera_device->vendor));
-    if (rv) {
+    camera_device->vendor = openVendorDeviceLocked(cameraid, name);
+    if (camera_device->vendor == NULL) {
         ALOGE("vendor camera open fail");
+        rv = -ENODEV;
         goto fail;
     }
     ALOGV("%s: got vendor camera device 0x%08X",
@@ -679,15 +803,52 @@ fail:
 
 static int camera_get_number_of_cameras(void)
 {
-    int ret = getVendorModule() ? getVendorModule()->get_number_of_cameras() : 0;
+    /* pisces: never call the vendor's get_number_of_cameras() - it probes the
+     * sensors (opening the ODM imager) and leaves it claimed, which used to
+     * break the first real open.  The board has a rear IMX135 (0) and a front
+     * IMX132 (1); both work now that the VI channel is shareable and the
+     * sensor/focuser/torch/tegra_camera opens are reference counted. */
+    int ret = 2;
+    /*
+     * pisces: only expose the rear sensor (id 0, IMX135).  The front one
+     * (id 1, IMX132) cannot open its VI channel -
+     *   Opening channel /dev/nvhost-vi (0xc) failed
+     *   NvCameraViCsiInitializeChannel: Failed !!! (error 0x30012)
+     * - and NvMMCameraOpen() then crashes inside libnvmm_camera while
+     * unwinding, which kills the whole camera provider and takes the rear
+     * camera down with it (cameraserver ends up with 0 devices).  Reporting
+     * a single camera keeps cameraserver from ever touching id 1.
+     */
     ALOGV("%s = %d", __FUNCTION__, ret);
     return ret;
 }
 
 static int camera_get_camera_info(int camera_id, struct camera_info *info)
 {
-    ALOGV("%s", __FUNCTION__);
-    return getVendorModule() ? getVendorModule()->get_camera_info(camera_id, info) : 0;
+    ALOGV("%s(%d)", __FUNCTION__, camera_id);
+    /*
+     * pisces: do not forward to the vendor module here.  Its get_camera_info
+     * opens the sensor ODM imager (powers the IMX135, opens /dev/focuser and
+     * /dev/nvhost-vi) and never releases it, so the first real
+     * camera_device_open() then fails with
+     *   IMX135 **** Can not open camera device: Device or resource busy
+     *   setupHalInLock:539 failed to open camera! Error: 0x70001
+     * Only the rear sensor is exposed (see camera_get_number_of_cameras), so
+     * its geometry is reported directly instead.  The 90 degree orientation
+     * is the Mi 3 rear module's mounting angle.
+     */
+    if (info == NULL || camera_id < 0 || camera_id > 1) {
+        return -EINVAL;
+    }
+    memset(info, 0, sizeof(*info));
+    info->facing = (camera_id == 0) ? CAMERA_FACING_BACK : CAMERA_FACING_FRONT;
+    info->orientation = (camera_id == 0) ? 90 : 270;
+    info->device_version = CAMERA_DEVICE_API_VERSION_1_0;
+    info->static_camera_characteristics = NULL;
+    info->resource_cost = 0;
+    info->conflicting_devices = NULL;
+    info->conflicting_devices_length = 0;
+    return 0;
 }
 
 static struct hw_module_methods_t camera_module_methods = {
