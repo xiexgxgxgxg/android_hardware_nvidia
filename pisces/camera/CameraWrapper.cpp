@@ -826,6 +826,23 @@ done:
  */
 
 /*
+ * Dual-provider support: each camera provider instance serves exactly one
+ * sensor, chosen with the PISCES_CAM_ROLE environment variable ("rear" by
+ * default, "front" for the second instance).  Because every provider only ever
+ * handles one sensor, the vendor HAL is always in its "first session" state,
+ * which is the only state in which the CSI delivers frames.
+ */
+static int cameraIsFrontRole(void)
+{
+    static int front = -1;
+    if (front < 0) {
+        const char *role = getenv("PISCES_CAM_ROLE");
+        front = (role != NULL && strcmp(role, "front") == 0) ? 1 : 0;
+    }
+    return front;
+}
+
+/*
  * Debug switch: persist.pisces.camswap=1 makes camera id 0 open the front
  * sensor and id 1 the rear.  It exists so a "front sensor as the first session
  * of a process" (which streams) can be compared with a rear->front switch
@@ -833,6 +850,10 @@ done:
  */
 static int vendorCameraId(int id)
 {
+    /* dual-provider mode: the module id 0 is the sensor this instance serves */
+    if (cameraIsFrontRole()) {
+        return 1;
+    }
     char value[PROP_VALUE_MAX];
     if (property_get("persist.pisces.camswap", value, "0") >= 1 &&
             value[0] == '1') {
@@ -885,8 +906,9 @@ static int camera_device_open(const hw_module_t *module, const char *name,
     /* pisces: rear (0) and front (1); see camera_get_number_of_cameras().
      * Do not call the vendor here - its get_number_of_cameras() probes the
      * sensors and claims the imager. */
-    int num_cameras = 2;
-    ALOGI("camera count = %d", num_cameras);
+    int num_cameras = 1;
+    ALOGI("camera count = %d (role %s)", num_cameras,
+            cameraIsFrontRole() ? "front" : "rear");
 
     int rv = 0;
 
@@ -1008,29 +1030,26 @@ fail:
 
 static int camera_get_number_of_cameras(void)
 {
-    /* pisces: never call the vendor's get_number_of_cameras() - it probes the
-     * sensors (opening the ODM imager) and leaves it claimed, which used to
-     * break the first real open.  The board has a rear IMX135 (0) and a front
-     * IMX132 (1); both work now that the VI channel is shareable and the
-     * sensor/focuser/torch/tegra_camera opens are reference counted. */
-    int ret = 2;
     /*
-     * pisces: only expose the rear sensor (id 0, IMX135).  The front one
-     * (id 1, IMX132) cannot open its VI channel -
-     *   Opening channel /dev/nvhost-vi (0xc) failed
-     *   NvCameraViCsiInitializeChannel: Failed !!! (error 0x30012)
-     * - and NvMMCameraOpen() then crashes inside libnvmm_camera while
-     * unwinding, which kills the whole camera provider and takes the rear
-     * camera down with it (cameraserver ends up with 0 devices).  Reporting
-     * a single camera keeps cameraserver from ever touching id 1.
+     * pisces: never call the vendor's get_number_of_cameras() - it probes the
+     * sensors (opening the ODM imager) and leaves it claimed, which used to
+     * break the first real open.
+     *
+     * Dual-provider mode: each provider instance serves exactly one sensor
+     * (PISCES_CAM_ROLE), because the 2013 HAL can only serve one sensor per
+     * process - the second sensor opens but its CSI never delivers frames.
+     * The module therefore reports a single camera, numbered 0, and the
+     * provider's PISCES_CAM_ID_BASE makes the global camera id unique.
      */
-    ALOGV("%s = %d", __FUNCTION__, ret);
+    int ret = 1;
+    ALOGI("%s = %d (role %s)", __FUNCTION__, ret,
+            cameraIsFrontRole() ? "front" : "rear");
     return ret;
 }
 
 static int camera_get_camera_info(int camera_id, struct camera_info *info)
 {
-    ALOGV("%s(%d)", __FUNCTION__, camera_id);
+    ALOGI("%s(%d) role %s", __FUNCTION__, camera_id, cameraIsFrontRole() ? "front" : "rear");
     /*
      * pisces: do not forward to the vendor module here.  Its get_camera_info
      * opens the sensor ODM imager (powers the IMX135, opens /dev/focuser and
@@ -1042,14 +1061,16 @@ static int camera_get_camera_info(int camera_id, struct camera_info *info)
      * its geometry is reported directly instead.  The 90 degree orientation
      * is the Mi 3 rear module's mounting angle.
      */
-    if (info == NULL || camera_id < 0 || camera_id > 1) {
+    if (info == NULL || camera_id < 0 || camera_id > 0) {
         return -EINVAL;
     }
     memset(info, 0, sizeof(*info));
-    info->facing = (camera_id == 0) ? CAMERA_FACING_BACK : CAMERA_FACING_FRONT;
-    /* The front module is mounted 180 degrees from what nvcamera.conf claims
-     * (270); with 270 the preview came out upside down. */
-    info->orientation = (camera_id == 0) ? 90 : 90;
+    info->facing = cameraIsFrontRole() ? CAMERA_FACING_FRONT : CAMERA_FACING_BACK;
+    /* nvcamera.conf: rear 0, front 270.  The rear module is mounted at 90 in
+     * practice; the front uses the vendor value now that it is exposed as a
+     * real front camera (the framework mirrors it, which it does not do for a
+     * camera reported as back). */
+    info->orientation = cameraIsFrontRole() ? 270 : 90;
     info->device_version = CAMERA_DEVICE_API_VERSION_1_0;
     info->static_camera_characteristics = NULL;
     info->resource_cost = 0;
