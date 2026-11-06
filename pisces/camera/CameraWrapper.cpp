@@ -29,6 +29,7 @@
 
 #include <utils/threads.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -480,6 +481,33 @@ static int camera_cancel_picture(struct camera_device *device)
     return VENDOR_CALL(device, cancel_picture);
 }
 
+/*
+ * pisces: set_parameters() hands the vendor call to a detached thread so the
+ * framework is not blocked while the HAL waits for the preview.  The HAL
+ * blocks up to 5 s in WaitForStuffThatNeedsPreview() while applying front
+ * sensor settings, and the framework only starts the preview *after*
+ * set_parameters() returns - a rear->front switch therefore deadlocked Snap
+ * in AndroidCameraProxyImpl.setParameters until the activity was killed.
+ */
+struct params_job {
+    wrapper_camera_device_t *dev;
+    char *params;
+};
+
+static void *camera_apply_parameters(void *arg)
+{
+    struct params_job *job = reinterpret_cast<struct params_job *>(arg);
+
+    if (job->dev != NULL && job->dev->vendor != NULL &&
+            job->dev->vendor->ops->set_parameters != NULL) {
+        int ret = job->dev->vendor->ops->set_parameters(job->dev->vendor, job->params);
+        ALOGI("async set_parameters(cam %d) -> %d", CAMERA_ID(job->dev), ret);
+    }
+    free(job->params);
+    free(job);
+    return NULL;
+}
+
 static int camera_set_parameters(struct camera_device *device,
         const char *params)
 {
@@ -490,6 +518,19 @@ static int camera_set_parameters(struct camera_device *device,
         return -EINVAL;
 
     char *fixed_params = camera_fixup_setparams(toWrapper(device), params);
+
+    struct params_job *job = reinterpret_cast<struct params_job *>(malloc(sizeof(*job)));
+    if (job != NULL) {
+        job->dev = toWrapper(device);
+        job->params = fixed_params;
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, camera_apply_parameters, job) == 0) {
+            pthread_detach(thread);
+            return 0;
+        }
+        free(job);
+    }
+
     int ret = VENDOR_CALL(device, set_parameters, fixed_params);
     free(fixed_params);
     return ret;
