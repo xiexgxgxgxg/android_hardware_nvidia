@@ -30,6 +30,7 @@
 #include <utils/threads.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <cutils/properties.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -794,6 +795,22 @@ done:
  * so this function will always only be called once per camera instance
  */
 
+/*
+ * Debug switch: persist.pisces.camswap=1 makes camera id 0 open the front
+ * sensor and id 1 the rear.  It exists so a "front sensor as the first session
+ * of a process" (which streams) can be compared with a rear->front switch
+ * (which does not) without touching the camera app.
+ */
+static int vendorCameraId(int id)
+{
+    char value[PROP_VALUE_MAX];
+    if (property_get("persist.pisces.camswap", value, "0") >= 1 &&
+            value[0] == '1') {
+        return (id == 0) ? 1 : 0;
+    }
+    return id;
+}
+
 static camera_device_t *openVendorDeviceLocked(int id, const char *name)
 {
     if (id < 0 || id >= (int)(sizeof(gVendorDevices) / sizeof(gVendorDevices[0])))
@@ -804,9 +821,13 @@ static camera_device_t *openVendorDeviceLocked(int id, const char *name)
         return gVendorDevices[id];
     }
 
+    int real_id = vendorCameraId(id);
+    char real_name[8];
+    snprintf(real_name, sizeof(real_name), "%d", real_id);
+
     camera_device_t *dev = NULL;
     int rv = getVendorModule()->common.methods->open(
-            (const hw_module_t*)getVendorModule(), name, (hw_device_t**)&dev);
+            (const hw_module_t*)getVendorModule(), real_name, (hw_device_t**)&dev);
     if (rv != 0 || dev == NULL) {
         ALOGE("vendor camera open failed for %s: %d", name, rv);
         return NULL;
