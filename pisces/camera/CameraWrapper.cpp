@@ -774,24 +774,6 @@ static int camera_device_close(hw_device_t *device)
     usleep(300000);
     closeLeakedVendorFds();
 
-    /*
-     * After a rear session the front sensor can be opened and its I2C mode and
-     * stream-on succeed, yet the VI/CSI delivers no frames (sync point 15
-     * timeout, black then green preview) - the 2013 HAL does not reprogram the
-     * block for the new sensor.  The same front sensor streams fine as the
-     * first session of a process, so restart the provider after every close;
-     * the camera service retries the next open while the new provider
-     * registers, and set_parameters() is asynchronous so the framework does
-     * not deadlock during the switch.
-     */
-    {
-        pid_t child = fork();
-        if (child == 0) {
-            execl("/system/bin/sh", "sh", "-c", "sleep 0.15; kill -9 $PPID", (char *)NULL);
-            _exit(0);
-        }
-    }
-
     if (wrapper_dev->base.ops)
         delete wrapper_dev->base.ops;
     delete wrapper_dev;
