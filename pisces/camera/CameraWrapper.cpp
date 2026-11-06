@@ -761,6 +761,18 @@ static int camera_device_close(hw_device_t *device)
     /* pisces: force the next open to reload the HAL from scratch */
     unloadVendorModule();
 
+    /* Drop the private NvMM camera core copies so the next camera session gets
+     * freshly initialised static state (see the camshim). */
+    {
+        static void (*reset_nvmm)(void) = NULL;
+        if (reset_nvmm == NULL) {
+            reset_nvmm = (void (*)(void))dlsym(RTLD_DEFAULT, "pisces_cam_reset_nvmm");
+        }
+        if (reset_nvmm != NULL) {
+            reset_nvmm();
+        }
+    }
+
     /*
      * The vendor HAL never closes what it opened: after a camera session the
      * provider still holds /dev/imx135, /dev/focuser, /dev/torch,

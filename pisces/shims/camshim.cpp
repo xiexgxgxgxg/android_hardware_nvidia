@@ -24,6 +24,9 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <errno.h>
 #include <android/log.h>
 #include <dlfcn.h>
 
@@ -286,10 +289,133 @@ void *dlopen(const char *filename, int flags)
         real_dlopen = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
     }
     void *handle = (real_dlopen != NULL) ? real_dlopen(filename, flags) : NULL;
-    if (filename != NULL && strstr(filename, "nvmm") != NULL) {
+    if (filename != NULL && strstr(filename, "nvmm_camera") != NULL) {
         __android_log_print(ANDROID_LOG_DEBUG, "DlOpen",
                 "dlopen(%s, 0x%x) -> %p (from %p)", filename, flags, handle,
                 __builtin_return_address(0));
     }
     return handle;
+}
+
+/*
+ * The NvMM core (libnvmm.so) loads libnvmm_camera.so at runtime with
+ * __android_dlopen_ext().  That library keeps per-process static state (the
+ * focus-motor guard, the VI/CSI programming, the FixFence bookkeeping), which
+ * is what makes a second camera sensor in the same process fail: the sensor
+ * opens and streams but its CSI never delivers frames.
+ *
+ * Redirect that load to a private copy with a unique SONAME, and drop the copy
+ * when the camera is closed, so every camera session gets a freshly
+ * initialised NvMM camera core without restarting the provider.
+ */
+#define CAM_TEMPLATE "/data/misc/pisces_camera/nvmmcam.tpl"
+#define CAM_COPY_DIR "/data/misc/pisces_camera"
+#define CAM_SONAME_PREFIX "libpisces_nvmm_cam_"
+#define CAM_SONAME_LEN 25   /* "libpisces_nvmm_cam_2.so" */
+
+static void *gNvmmHandles[8];
+static int gNvmmHandleCount;
+static int gNvmmSession;
+
+static int copyFile(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY);
+    if (in < 0) {
+        return -1;
+    }
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0660);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    char buf[16384];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, n) != n) {
+            close(in);
+            close(out);
+            return -1;
+        }
+    }
+    close(in);
+    close(out);
+    return 0;
+}
+
+/* Rewrite the template's SONAME in the copy so the loader sees a new object. */
+static void patchSoname(const char *path, char tag)
+{
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        return;
+    }
+    off_t size = lseek(fd, 0, SEEK_END);
+    char *map = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map != MAP_FAILED) {
+        char from[CAM_SONAME_LEN + 1];
+        snprintf(from, sizeof(from), "libpisces_nvmm_cam_2.so");
+        char to[CAM_SONAME_LEN + 1];
+        snprintf(to, sizeof(to), "libpisces_nvmm_cam_%c.so", tag);
+        for (off_t i = 0; i + CAM_SONAME_LEN < size; i++) {
+            if (memcmp(map + i, from, CAM_SONAME_LEN) == 0) {
+                memcpy(map + i, to, CAM_SONAME_LEN);
+            }
+        }
+        munmap(map, size);
+    }
+    close(fd);
+}
+
+static void *loadPrivateNvmmCamera(void)
+{
+    int n = gNvmmSession++ % 10;
+    char tag = '0' + n;
+    char path[128];
+    snprintf(path, sizeof(path), CAM_COPY_DIR "/nvmmcam_%d.so", n);
+
+    if (copyFile(CAM_TEMPLATE, path) != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "NvmmCam",
+                "cannot copy %s: %s", CAM_TEMPLATE, strerror(errno));
+        return NULL;
+    }
+    patchSoname(path, tag);
+
+    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    __android_log_print(ANDROID_LOG_INFO, "NvmmCam",
+            "private NvMM camera core: %s -> %p (%s)", path, handle,
+            handle ? "" : dlerror());
+    if (handle != NULL && gNvmmHandleCount < 8) {
+        gNvmmHandles[gNvmmHandleCount++] = handle;
+    }
+    return handle;
+}
+
+/* Called from the wrapper when a camera is closed: drop the private copies. */
+extern "C" __attribute__((visibility("default")))
+void pisces_cam_reset_nvmm(void)
+{
+    for (int i = 0; i < gNvmmHandleCount; i++) {
+        dlclose(gNvmmHandles[i]);
+        gNvmmHandles[i] = NULL;
+    }
+    gNvmmHandleCount = 0;
+    __android_log_print(ANDROID_LOG_INFO, "NvmmCam", "reset done");
+}
+
+extern "C" __attribute__((visibility("default")))
+void *__android_dlopen_ext(const char *filename, int flags, const void *extinfo)
+{
+    static void *(*real_ext)(const char *, int, const void *) = NULL;
+    if (real_ext == NULL) {
+        real_ext = (void *(*)(const char *, int, const void *))
+                dlsym(RTLD_NEXT, "__android_dlopen_ext");
+    }
+
+    if (filename != NULL && strstr(filename, "nvmm_camera") != NULL) {
+        void *handle = loadPrivateNvmmCamera();
+        if (handle != NULL) {
+            return handle;
+        }
+    }
+    return (real_ext != NULL) ? real_ext(filename, flags, extinfo) : NULL;
 }
