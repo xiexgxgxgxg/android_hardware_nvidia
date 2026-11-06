@@ -311,7 +311,7 @@ void *dlopen(const char *filename, int flags)
 #define CAM_TEMPLATE "/data/misc/pisces_camera/nvmmcam.tpl"
 #define CAM_COPY_DIR "/data/misc/pisces_camera"
 #define CAM_SONAME_PREFIX "libpisces_nvmm_cam_"
-#define CAM_SONAME_LEN 25   /* "libpisces_nvmm_cam_2.so" */
+#define CAM_SONAME_LEN 17   /* "libnvmm_camera.so" */
 
 static void *gNvmmHandles[8];
 static int gNvmmHandleCount;
@@ -353,9 +353,9 @@ static void patchSoname(const char *path, char tag)
     char *map = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map != MAP_FAILED) {
         char from[CAM_SONAME_LEN + 1];
-        snprintf(from, sizeof(from), "libpisces_nvmm_cam_2.so");
+        snprintf(from, sizeof(from), "libnvmm_camera.so");
         char to[CAM_SONAME_LEN + 1];
-        snprintf(to, sizeof(to), "libpisces_nvmm_cam_%c.so", tag);
+        snprintf(to, sizeof(to), "libnvmm_camer%c.so", tag);
         for (off_t i = 0; i + CAM_SONAME_LEN < size; i++) {
             if (memcmp(map + i, from, CAM_SONAME_LEN) == 0) {
                 memcpy(map + i, to, CAM_SONAME_LEN);
@@ -368,8 +368,8 @@ static void patchSoname(const char *path, char tag)
 
 static void *loadPrivateNvmmCamera(void)
 {
-    int n = gNvmmSession++ % 10;
-    char tag = '0' + n;
+    int n = gNvmmSession++ % 36;
+    char tag = (n < 10) ? ('0' + n) : ('a' + (n - 10));
     char path[128];
     snprintf(path, sizeof(path), CAM_COPY_DIR "/nvmmcam_%d.so", n);
 
@@ -394,12 +394,12 @@ static void *loadPrivateNvmmCamera(void)
 extern "C" __attribute__((visibility("default")))
 void pisces_cam_reset_nvmm(void)
 {
-    for (int i = 0; i < gNvmmHandleCount; i++) {
-        dlclose(gNvmmHandles[i]);
-        gNvmmHandles[i] = NULL;
-    }
-    gNvmmHandleCount = 0;
-    __android_log_print(ANDROID_LOG_INFO, "NvmmCam", "reset done");
+    /* The NvMM keeps pointers into the camera core until its own unload path
+     * runs, so unloading here crashed the provider (SIGSEGV in the HwBinder
+     * thread).  Keep the copies loaded instead; each session gets a new one
+     * through a unique SONAME. */
+    __android_log_print(ANDROID_LOG_INFO, "NvmmCam", "session %d done",
+            gNvmmSession);
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -418,4 +418,63 @@ void *__android_dlopen_ext(const char *filename, int flags, const void *extinfo)
         }
     }
     return (real_ext != NULL) ? real_ext(filename, flags, extinfo) : NULL;
+}
+
+/*
+ * The NvMM core does not call dlopen(): it uses the NvOS wrappers
+ * NvOsLibraryLoad/GetSymbol/Unload from libnvos.so.  Intercepting
+ * NvOsLibraryLoad is therefore the right hook to hand the camera core a fresh
+ * private copy per camera session.
+ */
+typedef void *(*nvos_libload_t)(const char *name);
+typedef void (*nvos_libunload_t)(void *handle);
+
+static nvos_libload_t gRealLibLoad = NULL;
+static nvos_libunload_t gRealLibUnload = NULL;
+
+static void resolveNvos(void)
+{
+    if (gRealLibLoad != NULL) {
+        return;
+    }
+    void *handle = dlopen("libnvos.so", RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "NvmmCam", "no libnvos: %s", dlerror());
+        return;
+    }
+    gRealLibLoad = (nvos_libload_t)dlsym(handle, "NvOsLibraryLoad");
+    gRealLibUnload = (nvos_libunload_t)dlsym(handle, "NvOsLibraryUnload");
+}
+
+extern "C" __attribute__((visibility("default")))
+void *NvOsLibraryLoad(const char *name)
+{
+    resolveNvos();
+    __android_log_print(ANDROID_LOG_DEBUG, "NvmmCam", "NvOsLibraryLoad(%s) called", name ? name : "(null)");
+
+    if (0 && name != NULL && strstr(name, "nvmm_camera") != NULL) {
+        /* disabled: a second copy of the library interposes its own global
+         * symbols and the NvMM crashes (SIGSEGV in its HwBinder thread), so a
+         * fresh NvMM core per session is not possible this way. */
+        void *handle = loadPrivateNvmmCamera();
+        if (handle != NULL) {
+            return handle;
+        }
+    }
+    return (gRealLibLoad != NULL) ? gRealLibLoad(name) : NULL;
+}
+
+extern "C" __attribute__((visibility("default")))
+void NvOsLibraryUnload(void *handle)
+{
+    resolveNvos();
+    for (int i = 0; i < gNvmmHandleCount; i++) {
+        if (gNvmmHandles[i] == handle) {
+            /* keep it loaded - see pisces_cam_reset_nvmm() */
+            return;
+        }
+    }
+    if (gRealLibUnload != NULL) {
+        gRealLibUnload(handle);
+    }
 }
