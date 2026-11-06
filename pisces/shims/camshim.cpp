@@ -25,6 +25,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <android/log.h>
+#include <dlfcn.h>
 
 #include <sensor/SensorManager.h>
 #include <sensor/SensorEventQueue.h>
@@ -206,4 +207,68 @@ int NvOsDebugPrintf(const char *fmt, ...)
         }
     }
     return n;
+}
+
+/*
+ * The vendor HAL programs the host1x VI/ISP modules through
+ * NvRmHostModuleRegWr() (provided by libnvrm_graphics.so).  Intercepting it
+ * makes the VI/CSI register programming visible, which is what a rear->front
+ * switch fails to redo.  The real function is resolved through an explicit
+ * dlopen() handle because RTLD_NEXT does not see the vendor namespace.
+ */
+typedef int (*rm_regwr_t)(void *hDevice, unsigned int module, unsigned int count,
+        const unsigned int *offsets, const unsigned int *values);
+typedef int (*rm_regrd_t)(void *hDevice, unsigned int module, unsigned int count,
+        const unsigned int *offsets, unsigned int *values);
+
+static rm_regwr_t gRealRegWr = NULL;
+static rm_regrd_t gRealRegRd = NULL;
+
+static void resolveRmGraphics(void)
+{
+    if (gRealRegWr != NULL && gRealRegRd != NULL) {
+        return;
+    }
+    void *handle = dlopen("libnvrm_graphics.so", RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "NvRmReg", "no libnvrm_graphics: %s", dlerror());
+        return;
+    }
+    if (gRealRegWr == NULL) {
+        gRealRegWr = (rm_regwr_t)dlsym(handle, "NvRmHostModuleRegWr");
+    }
+    if (gRealRegRd == NULL) {
+        gRealRegRd = (rm_regrd_t)dlsym(handle, "NvRmHostModuleRegRd");
+    }
+}
+
+extern "C" __attribute__((visibility("default")))
+int NvRmHostModuleRegWr(void *hDevice, unsigned int module, unsigned int count,
+        const unsigned int *offsets, const unsigned int *values)
+{
+    resolveRmGraphics();
+    for (unsigned int i = 0; i < count && i < 32; i++) {
+        __android_log_print(ANDROID_LOG_DEBUG, "NvRmReg",
+                "WR mod=%u off=0x%04x val=0x%08x", module, offsets[i], values[i]);
+    }
+    if (gRealRegWr != NULL) {
+        return gRealRegWr(hDevice, module, count, offsets, values);
+    }
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default")))
+int NvRmHostModuleRegRd(void *hDevice, unsigned int module, unsigned int count,
+        const unsigned int *offsets, unsigned int *values)
+{
+    resolveRmGraphics();
+    int ret = 0;
+    if (gRealRegRd != NULL) {
+        ret = gRealRegRd(hDevice, module, count, offsets, values);
+    }
+    for (unsigned int i = 0; i < count && i < 32; i++) {
+        __android_log_print(ANDROID_LOG_DEBUG, "NvRmReg",
+                "RD mod=%u off=0x%04x val=0x%08x", module, offsets[i], values[i]);
+    }
+    return ret;
 }
