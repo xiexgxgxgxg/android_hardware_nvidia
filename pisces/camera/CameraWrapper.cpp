@@ -525,7 +525,7 @@ static void cacheCameraParameters(wrapper_camera_device_t *wrapper)
         return;
     }
     char path[128];
-    snprintf(path, sizeof(path), "/data/misc/cameraserver/pisces_params_%d.txt",
+    snprintf(path, sizeof(path), "/data/misc/pisces_camera/params_%d.txt",
             CAMERA_ID(wrapper));
 
     for (int attempt = 0; attempt < 10; attempt++) {
@@ -571,11 +571,11 @@ static char *camera_get_parameters(struct camera_device *device)
      */
     if (fixed_params == NULL || fixed_params[0] == '\0') {
         char path[128];
-        snprintf(path, sizeof(path), "/data/misc/cameraserver/pisces_params_%d.txt",
+        snprintf(path, sizeof(path), "/data/misc/pisces_camera/params_%d.txt",
                 CAMERA_ID(device));
         char *cached_params = readFileToString(path);
         if (cached_params == NULL) {
-            cached_params = readFileToString("/data/misc/cameraserver/pisces_shim_params.txt");
+            cached_params = readFileToString("/data/misc/pisces_camera/params_0.txt");
         }
         if (cached_params != NULL && cached_params[0] != '\0') {
             ALOGW("vendor returned empty parameters, using the cached blob");
