@@ -272,3 +272,24 @@ int NvRmHostModuleRegRd(void *hDevice, unsigned int module, unsigned int count,
     }
     return ret;
 }
+
+/*
+ * Trace which library loads libnvmm_camera.so (the blob's camera core, where
+ * the per-process static guards live) and how: it is not in any of the camera
+ * libraries' DT_NEEDED lists, so it must be an explicit dlopen().
+ */
+extern "C" __attribute__((visibility("default")))
+void *dlopen(const char *filename, int flags)
+{
+    static void *(*real_dlopen)(const char *, int) = NULL;
+    if (real_dlopen == NULL) {
+        real_dlopen = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
+    }
+    void *handle = (real_dlopen != NULL) ? real_dlopen(filename, flags) : NULL;
+    if (filename != NULL && strstr(filename, "nvmm") != NULL) {
+        __android_log_print(ANDROID_LOG_DEBUG, "DlOpen",
+                "dlopen(%s, 0x%x) -> %p (from %p)", filename, flags, handle,
+                __builtin_return_address(0));
+    }
+    return handle;
+}
