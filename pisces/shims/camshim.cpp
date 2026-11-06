@@ -30,6 +30,8 @@
 #include <sensor/SensorEventQueue.h>
 #include <utils/String16.h>
 #include <utils/String8.h>
+#include <utils/CallStack.h>
+#include <string.h>
 
 using android::SensorEventQueue;
 using android::Sensor;
@@ -193,6 +195,15 @@ int NvOsDebugPrintf(const char *fmt, ...)
     va_end(ap);
     if (n > 0) {
         __android_log_write(ANDROID_LOG_DEBUG, "NvOsDbg", line);
+        /* pisces: dump the call stack for the messages that mark the video
+         * path state, so the blob's internal functions can be located by
+         * address (see /proc/<pid>/maps for the library base). */
+        if (strstr(line, "ViCsi") != NULL ||
+                strstr(line, "already initialized") != NULL ||
+                strstr(line, "syncpt") != NULL) {
+            android::CallStack stack("NvOsDbg");
+            stack.log("NvOsDbg");
+        }
     }
     return n;
 }
