@@ -22,6 +22,9 @@
  */
 
 #include <unistd.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <android/log.h>
 
 #include <sensor/SensorManager.h>
 #include <sensor/SensorEventQueue.h>
@@ -165,4 +168,31 @@ PISCES_METHOD(int) _ZNK7android16SensorEventQueue12setEventRateEPKNS_6SensorEx(v
     (void)sensor;
     (void)rate;
     return 0;
+}
+
+/*
+ * The vendor HAL reports its whole internal state machine through the imported
+ * NvOsDebugPrintf() symbol (VI/CSI initialisation, "already initialized"
+ * guards, block container errors).  The shim is loaded RTLD_GLOBAL before the
+ * vendor module, so defining it here routes those messages to logcat with a
+ * known tag, which is what makes debugging the rear->front switch possible.
+ */
+extern "C" __attribute__((visibility("default")))
+__attribute__((format(printf, 1, 2)))
+int NvOsDebugPrintf(const char *fmt, ...);
+
+extern "C" __attribute__((visibility("default")))
+__attribute__((format(printf, 1, 2)))
+int NvOsDebugPrintf(const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    const char *format = (fmt != NULL && fmt[0] != '\0') ? fmt : "(null)";
+    int n = vsnprintf(line, sizeof(line), format, ap);
+    va_end(ap);
+    if (n > 0) {
+        __android_log_write(ANDROID_LOG_DEBUG, "NvOsDbg", line);
+    }
+    return n;
 }
