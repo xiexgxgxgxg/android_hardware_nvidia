@@ -29,6 +29,11 @@
 
 #include <utils/threads.h>
 #include <dlfcn.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <utils/String8.h>
 #include <hardware/hardware.h>
 #include <hardware/camera.h>
@@ -490,6 +495,61 @@ static int camera_set_parameters(struct camera_device *device,
     return ret;
 }
 
+/*
+ * pisces: remember each sensor's parameter blob.  Right after a camera open
+ * the vendor HAL can still return an empty parameter string (its settings are
+ * applied asynchronously), and the framework then configures the sensor with
+ * whatever it got - for the front camera that used to be the rear camera's
+ * 13 MP blob, which made setParameters time out (0x5) and Snap crash.  Cache
+ * per camera id so the right blob is always available.
+ */
+static char *readFileToString(const char *path)
+{
+    FILE *f = fopen(path, "re");
+    if (f == NULL) {
+        return NULL;
+    }
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        return NULL;
+    }
+    buf[n] = '\0';
+    return strdup(buf);
+}
+
+static void cacheCameraParameters(wrapper_camera_device_t *wrapper)
+{
+    if (wrapper->vendor == NULL || wrapper->vendor->ops->get_parameters == NULL) {
+        return;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/data/misc/cameraserver/pisces_params_%d.txt",
+            CAMERA_ID(wrapper));
+
+    for (int attempt = 0; attempt < 10; attempt++) {
+        char *params = wrapper->vendor->ops->get_parameters(wrapper->vendor);
+        size_t len = (params != NULL) ? strlen(params) : 0;
+        if (len > 0) {
+            FILE *f = fopen(path, "we");
+            if (f != NULL) {
+                fwrite(params, 1, len, f);
+                fclose(f);
+            }
+            ALOGI("cached %zu parameter bytes for camera %d", len, CAMERA_ID(wrapper));
+        }
+        if (params != NULL && wrapper->vendor->ops->put_parameters != NULL) {
+            wrapper->vendor->ops->put_parameters(wrapper->vendor, params);
+        }
+        if (len > 0) {
+            return;
+        }
+        usleep(200000);
+    }
+    ALOGW("no parameters from the vendor for camera %d", CAMERA_ID(wrapper));
+}
+
 static char *camera_get_parameters(struct camera_device *device)
 {
     ALOGV("%s->%08X->%08X", __FUNCTION__, (uintptr_t)device,
@@ -503,35 +563,30 @@ static char *camera_get_parameters(struct camera_device *device)
     VENDOR_CALL(device, put_parameters, params);
 
     /*
-     * pisces: after a provider restart (the wrapper kills the provider on
-     * every close so the next session starts from clean HAL state) the first
-     * get_parameters() can race the HAL's initialisation and come back empty.
-     * Snap then dies with "getParameters failed (empty parameters)" right
-     * after a rear<->front switch.  Fall back to the parameter blob captured
-     * from a working session (the same file the camera service uses for the
-     * legacy shim) instead of handing the framework an empty string.
+     * pisces: right after a camera open the vendor HAL can still return an
+     * empty parameter string; the framework then configures the wrong sensor
+     * (the front got the rear's 13 MP blob, setParameters timed out with 0x5
+     * and Snap crashed).  Serve the per-camera blob captured by
+     * cacheCameraParameters() instead.
      */
     if (fixed_params == NULL || fixed_params[0] == '\0') {
-        static char *cached_params = NULL;
+        char path[128];
+        snprintf(path, sizeof(path), "/data/misc/cameraserver/pisces_params_%d.txt",
+                CAMERA_ID(device));
+        char *cached_params = readFileToString(path);
         if (cached_params == NULL) {
-            FILE *f = fopen("/data/misc/cameraserver/pisces_shim_params.txt", "re");
-            if (f != NULL) {
-                static char buf[4096];
-                size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-                fclose(f);
-                if (n > 0) {
-                    buf[n] = '\0';
-                    cached_params = strdup(buf);
-                }
-            }
+            cached_params = readFileToString("/data/misc/cameraserver/pisces_shim_params.txt");
         }
         if (cached_params != NULL && cached_params[0] != '\0') {
             ALOGW("vendor returned empty parameters, using the cached blob");
             if (fixed_params != NULL) {
                 free(fixed_params);
             }
-            return strdup(cached_params);
+            char *result = strdup(cached_params);
+            free(cached_params);
+            return result;
         }
+        free(cached_params);
     }
     return fixed_params;
 }
@@ -589,6 +644,45 @@ extern "C" void heaptracker_free_leaked_memory(void);
 // when an app connects, so keep one vendor device per camera id and reuse it.
 static camera_device_t *gVendorDevices[4] = { NULL, NULL, NULL, NULL };
 
+/* Close the device nodes the vendor HAL leaks when a camera session ends. */
+static void closeLeakedVendorFds()
+{
+    static const char *nodes[] = {
+        "/dev/nvhost-vi", "/dev/nvhost-isp", "/dev/tegra_camera",
+        "/dev/imx135", "/dev/imx132", "/dev/focuser", "/dev/torch",
+        "/dev/mipi-cal", "/dev/tegra_sema", NULL
+    };
+
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == NULL) {
+        return;
+    }
+    int dir_fd = dirfd(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        int fd = atoi(entry->d_name);
+        if (fd <= 2 || fd == dir_fd) {
+            continue;
+        }
+        char link[64];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        char target[256];
+        ssize_t len = readlink(link, target, sizeof(target) - 1);
+        if (len <= 0) {
+            continue;
+        }
+        target[len] = '\0';
+        for (int i = 0; nodes[i] != NULL; i++) {
+            if (strncmp(target, nodes[i], strlen(nodes[i])) == 0) {
+                ALOGI("closing leaked %s (fd %d)", target, fd);
+                close(fd);
+                break;
+            }
+        }
+    }
+    closedir(dir);
+}
+
 /* Drop the vendor module so the next open reloads it with fresh globals.  See
  * the comment at gVendorHandle. */
 static void unloadVendorModule()
@@ -626,22 +720,19 @@ static int camera_device_close(hw_device_t *device)
     unloadVendorModule();
 
     /*
-     * The vendor HAL never fully resets its module-global state (focus motor
-     * "NvFmInitialize: Failed already initialized", NvMM block container,
-     * VI/CSI routing for the previous sensor).  A rear->front switch opened
-     * the front sensor but its CSI never produced frames (sync point 15
-     * timeout, black then green preview), while the same front sensor streams
-     * fine as the first session of a process.  So restart the provider after
-     * every camera close: init brings the service back and the camera service
-     * retries the next open until the fresh provider registers.
+     * The vendor HAL never closes what it opened: after a camera session the
+     * provider still holds /dev/imx135, /dev/focuser, /dev/torch,
+     * /dev/tegra_camera and the nvhost VI channel.  The next session then
+     * reuses the previous sensor's VI channel/hardware context, which is why a
+     * rear->front switch opened the front sensor ("[imx132]: stream on") but
+     * its CSI never produced frames (sync point 15 timeout, black then green
+     * preview).  Close those leaked descriptors here, after the HAL has been
+     * given a moment to tear its own state down, so the next open starts from
+     * a genuinely free VI channel and sensor.
      */
-    {
-        pid_t child = fork();
-        if (child == 0) {
-            execl("/system/bin/sh", "sh", "-c", "sleep 0.15; kill -9 $PPID", (char *)NULL);
-            _exit(0);
-        }
-    }
+    usleep(300000);
+    closeLeakedVendorFds();
+
     if (wrapper_dev->base.ops)
         delete wrapper_dev->base.ops;
     delete wrapper_dev;
@@ -743,12 +834,27 @@ static int camera_device_open(const hw_module_t *module, const char *name,
     ALOGV("calling vendor camera_device_open ...");
     camera_device->vendor = openVendorDeviceLocked(cameraid, name);
     if (camera_device->vendor == NULL) {
+        /*
+         * pisces: the previous session's HAL teardown is asynchronous, so the
+         * next open can still see "NvFmInitialize: Failed already initialized"
+         * and fail with 0xd.  A second attempt a moment later succeeds (this
+         * is what the app used to do by falling back from openLegacy to
+         * open), so retry here instead of failing the switch.
+         */
+        for (int attempt = 0; attempt < 6 && camera_device->vendor == NULL; attempt++) {
+            usleep(300000);
+            ALOGW("vendor camera open failed, retry %d", attempt + 1);
+            camera_device->vendor = openVendorDeviceLocked(cameraid, name);
+        }
+    }
+    if (camera_device->vendor == NULL) {
         ALOGE("vendor camera open fail");
         rv = -ENODEV;
         goto fail;
     }
     ALOGV("%s: got vendor camera device 0x%08X",
             __FUNCTION__, (uintptr_t)(camera_device->vendor));
+    cacheCameraParameters(camera_device);
 
     camera_ops = new camera_device_ops_t();
     if (!camera_ops) {
