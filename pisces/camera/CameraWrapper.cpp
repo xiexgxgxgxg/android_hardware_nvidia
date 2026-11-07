@@ -172,6 +172,20 @@ static char *camera_fixup_setparams(wrapper_camera_device_t *wrapper __attribute
     android::CameraParameters params;
     params.unflatten(android::String8(settings));
 
+    /*
+     * pisces: the 2013 HAL only arms the flash (it sets the LED current and
+     * timer through /dev/torch) and never triggers the strobe GPIO that would
+     * actually light the LED, so any capture taken with flash auto/on comes
+     * back as an all-black JPEG.  Until that is fixed, force the flash off:
+     * the photo is then exposed correctly instead of being black.
+     */
+    const char *flash = params.get(android::CameraParameters::KEY_FLASH_MODE);
+    if (flash != NULL && strcmp(flash, android::CameraParameters::FLASH_MODE_OFF) != 0) {
+        ALOGI("%s: forcing flash-mode off (requested '%s')", __FUNCTION__, flash);
+        params.set(android::CameraParameters::KEY_FLASH_MODE,
+                   android::CameraParameters::FLASH_MODE_OFF);
+    }
+
 #ifdef LOG_PARAMETERS
     ALOGV("%s: original parameters:", __FUNCTION__);
     params.dump();
