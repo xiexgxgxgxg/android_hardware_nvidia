@@ -36,6 +36,7 @@
 #include <utils/String8.h>
 #include <utils/CallStack.h>
 #include <string.h>
+#include <cutils/properties.h>
 
 using android::SensorEventQueue;
 using android::Sensor;
@@ -281,12 +282,25 @@ int NvRmHostModuleRegRd(void *hDevice, unsigned int module, unsigned int count,
  * the per-process static guards live) and how: it is not in any of the camera
  * libraries' DT_NEEDED lists, so it must be an explicit dlopen().
  */
+static void *loadPrivateNvmmCamera(void);
+static void *getSessionNvmmCamera(void);
+
 extern "C" __attribute__((visibility("default")))
 void *dlopen(const char *filename, int flags)
 {
     static void *(*real_dlopen)(const char *, int) = NULL;
     if (real_dlopen == NULL) {
         real_dlopen = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
+    }
+    if (filename != NULL && strstr(filename, "nvmm_camera") != NULL &&
+            strstr(filename, "nvmmcam_") == NULL) {
+        void *priv = getSessionNvmmCamera();
+        __android_log_print(ANDROID_LOG_DEBUG, "DlOpen",
+                "dlopen(%s, 0x%x) -> private %p (from %p)", filename, flags,
+                priv, __builtin_return_address(0));
+        if (priv != NULL) {
+            return priv;
+        }
     }
     void *handle = (real_dlopen != NULL) ? real_dlopen(filename, flags) : NULL;
     if (filename != NULL && strstr(filename, "nvmm_camera") != NULL) {
@@ -390,6 +404,45 @@ static void *loadPrivateNvmmCamera(void)
     return handle;
 }
 
+/* The blob dlopen()s its camera core several times per session; hand out the
+ * same private copy until the session ends (see pisces_cam_reset_nvmm). */
+static void *gSessionNvmm;
+
+/*
+ * Per-session private copy of libnvmm_camera.so.
+ *
+ * The copy exists so that a *single provider process* can serve more than one
+ * camera session: the core keeps per-process static state (the focus motor
+ * guard that makes the second NvMMCameraOpen fail with 0xd) and never resets
+ * it.  When the wrapper restarts the provider after every close
+ * (persist.pisces.camkill, the default) the next session already runs in a
+ * fresh process, so the copy is pure overhead (1 MB written to /data per
+ * camera close) and defaults to off there.  With camkill=0 it defaults to on.
+ * persist.pisces.campriv overrides the default.
+ */
+static int privateNvmmEnabled(void)
+{
+    char value[PROP_VALUE_MAX];
+    if (property_get("persist.pisces.campriv", value, NULL) >= 1 && value[0] != '\0') {
+        return value[0] != '0';
+    }
+    if (property_get("persist.pisces.camkill", value, "1") >= 1 && value[0] == '1') {
+        return 0;
+    }
+    return 1;
+}
+
+static void *getSessionNvmmCamera(void)
+{
+    if (!privateNvmmEnabled()) {
+        return NULL;
+    }
+    if (gSessionNvmm == NULL) {
+        gSessionNvmm = loadPrivateNvmmCamera();
+    }
+    return gSessionNvmm;
+}
+
 /* Called from the wrapper when a camera is closed: drop the private copies. */
 extern "C" __attribute__((visibility("default")))
 void pisces_cam_reset_nvmm(void)
@@ -398,6 +451,7 @@ void pisces_cam_reset_nvmm(void)
      * runs, so unloading here crashed the provider (SIGSEGV in the HwBinder
      * thread).  Keep the copies loaded instead; each session gets a new one
      * through a unique SONAME. */
+    gSessionNvmm = NULL;
     __android_log_print(ANDROID_LOG_INFO, "NvmmCam", "session %d done",
             gNvmmSession);
 }
@@ -411,8 +465,9 @@ void *__android_dlopen_ext(const char *filename, int flags, const void *extinfo)
                 dlsym(RTLD_NEXT, "__android_dlopen_ext");
     }
 
-    if (filename != NULL && strstr(filename, "nvmm_camera") != NULL) {
-        void *handle = loadPrivateNvmmCamera();
+    if (filename != NULL && strstr(filename, "nvmm_camera") != NULL &&
+            strstr(filename, "nvmmcam_") == NULL) {
+        void *handle = getSessionNvmmCamera();
         if (handle != NULL) {
             return handle;
         }

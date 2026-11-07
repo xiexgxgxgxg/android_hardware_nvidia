@@ -656,6 +656,8 @@ static int camera_send_command(struct camera_device *device,
     return VENDOR_CALL(device, send_command, cmd, arg1, arg2);
 }
 
+static int wrapperProp(const char *name, int def);
+
 static void camera_release(struct camera_device *device)
 {
     ALOGV("%s->%08X->%08X", __FUNCTION__, (uintptr_t)device,
@@ -663,6 +665,14 @@ static void camera_release(struct camera_device *device)
 
     if (!device)
         return;
+
+    /* pisces: in restart mode the provider is killed by camera_device_close()
+     * a few microseconds later, and the vendor release path costs seconds
+     * (it waits for its own teardown timeouts).  The app's Camera.release()
+     * is synchronous, so blocking here froze the camera app's UI. */
+    if (wrapperProp("persist.pisces.camkill", 1)) {
+        return;
+    }
 
     VENDOR_CALL(device, release);
 }
@@ -737,6 +747,15 @@ static void unloadVendorModule()
     gVendorModule = NULL;
 }
 
+static int wrapperProp(const char *name, int def)
+{
+    char value[PROP_VALUE_MAX];
+    if (property_get(name, value, NULL) < 1 || value[0] == '\0') {
+        return def;
+    }
+    return value[0] == '1' ? 1 : 0;
+}
+
 static int camera_device_close(hw_device_t *device)
 {
     wrapper_camera_device_t *wrapper_dev = reinterpret_cast<wrapper_camera_device_t *>(device);
@@ -751,6 +770,32 @@ static int camera_device_close(hw_device_t *device)
         goto done;
     }
 
+    /*
+     * pisces: restart mode (default).
+     *
+     * The vendor close path blocks for seconds (it waits for its own teardown
+     * timeouts) and then the provider process crashes in the HAL's worker
+     * thread anyway.  The camera app calls Camera.release()/CameraDevice.close()
+     * synchronously, so that wait was long enough to trigger "camera isn't
+     * responding" after a few switches.  Killing the provider right here makes
+     * the release path instant; the kernel closes the sensor/VI descriptors
+     * when the process dies, init respawns the provider, the framework keeps
+     * the camera device present (CameraProviderManager::removeProvider) and
+     * the next connect waits for the restarted provider
+     * (CameraService::getDeviceVersion).
+     */
+    if (wrapperProp("persist.pisces.camkill", 1)) {
+        pid_t child = fork();
+        if (child == 0) {
+            execl("/system/bin/sh", "sh", "-c", "kill -9 $PPID", (char *)NULL);
+            _exit(0);
+        }
+        if (wrapper_dev->base.ops)
+            delete wrapper_dev->base.ops;
+        delete wrapper_dev;
+        return ret;
+    }
+
     wrapper_dev->vendor->common.close((hw_device_t*)wrapper_dev->vendor);
     // note: the vendor device is not reusable after close; drop it from the cache
     for (size_t i = 0; i < sizeof(gVendorDevices) / sizeof(gVendorDevices[0]); i++) {
@@ -759,7 +804,9 @@ static int camera_device_close(hw_device_t *device)
         }
     }
     /* pisces: force the next open to reload the HAL from scratch */
-    unloadVendorModule();
+    if (wrapperProp("persist.pisces.camunload", 1)) {
+        unloadVendorModule();
+    }
 
     /* Drop the private NvMM camera core copies so the next camera session gets
      * freshly initialised static state (see the camshim). */
@@ -784,25 +831,9 @@ static int camera_device_close(hw_device_t *device)
      * given a moment to tear its own state down, so the next open starts from
      * a genuinely free VI channel and sensor.
      */
-    usleep(300000);
-    closeLeakedVendorFds();
-
-    /*
-     * The vendor HAL cannot serve a second sensor in the same process: after
-     * one camera session the next one opens but its CSI never delivers frames
-     * (sync point 15 timeout, black then green preview), in *both* directions.
-     * The same sensor always works as the first session of a process, so
-     * restart the provider after every close; the camera service retries the
-     * next open while the fresh provider registers.  set_parameters() is
-     * asynchronous and each sensor's parameter blob is cached, so the
-     * framework is not blocked or misconfigured during the switch.
-     */
-    {
-        pid_t child = fork();
-        if (child == 0) {
-            execl("/system/bin/sh", "sh", "-c", "kill -9 $PPID", (char *)NULL);
-            _exit(0);
-        }
+    usleep(150000);
+    if (wrapperProp("persist.pisces.camfdclose", 1)) {
+        closeLeakedVendorFds();
     }
 
     if (wrapper_dev->base.ops)
@@ -955,8 +986,8 @@ static int camera_device_open(const hw_module_t *module, const char *name,
          * is what the app used to do by falling back from openLegacy to
          * open), so retry here instead of failing the switch.
          */
-        for (int attempt = 0; attempt < 6 && camera_device->vendor == NULL; attempt++) {
-            usleep(300000);
+        for (int attempt = 0; attempt < 4 && camera_device->vendor == NULL; attempt++) {
+            usleep(150000);
             ALOGW("vendor camera open failed, retry %d", attempt + 1);
             camera_device->vendor = openVendorDeviceLocked(cameraid, name);
         }
