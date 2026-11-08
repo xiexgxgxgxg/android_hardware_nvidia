@@ -154,6 +154,18 @@ static char *camera_fixup_getparams(wrapper_camera_device_t *wrapper __attribute
     android::CameraParameters params;
     params.unflatten(android::String8(settings));
 
+    /*
+     * pisces: the HAL's flash path is broken - any capture taken while it
+     * believes flash is on comes back as an all-black frame (it arms the LED
+     * but never triggers the strobe, and the still is exposed for a flash that
+     * never fires).  Advertise "off" as the only flash mode so apps never ask
+     * for a setting that would produce black photos.
+     */
+    params.set(android::CameraParameters::KEY_FLASH_MODE,
+               android::CameraParameters::FLASH_MODE_OFF);
+    params.set(android::CameraParameters::KEY_SUPPORTED_FLASH_MODES,
+               android::CameraParameters::FLASH_MODE_OFF);
+
 #ifdef LOG_PARAMETERS
     ALOGV("%s: Original parameters:", __FUNCTION__);
     params.dump();
@@ -258,6 +270,8 @@ static void intercept_notify(int32_t msg_type,
  * ~600 mA.  Drive it ourselves around the capture and keep handing the HAL
  * flash-mode=off so the exposure is correct.
  */
+static void trace_led(const char *what);
+
 static void set_flash_led(bool on) {
     int fd = open("/sys/class/leds/flashlight/brightness", O_WRONLY);
     if (fd < 0) {
@@ -268,6 +282,7 @@ static void set_flash_led(bool on) {
     ssize_t written = write(fd, value, strlen(value));
     close(fd);
     ALOGI("%s: flashlight %s (%zd)", __FUNCTION__, on ? "on" : "off", written);
+    trace_led(on ? "led on" : "led off");
 }
 
 static void intercept_data(int32_t msg_type,
@@ -500,18 +515,26 @@ static int camera_take_picture(struct camera_device *device)
         params.unflatten(android::String8(current));
         const char *mode = params.get(android::CameraParameters::KEY_FLASH_MODE);
         flashOn = mode != NULL && strcmp(mode, android::CameraParameters::FLASH_MODE_OFF) != 0;
-        if (flashOn) {
-            ALOGI("%s: flash-mode was '%s', switching the HAL to off and driving the LED",
-                  __FUNCTION__, mode);
-            params.set(android::CameraParameters::KEY_FLASH_MODE,
-                       android::CameraParameters::FLASH_MODE_OFF);
-            android::String8 off = params.flatten();
-            VENDOR_CALL(device, set_parameters, off.string());
-        }
+        /* Always force flash off synchronously right before the capture: the
+         * regular set_parameters() path is asynchronous, so without this the
+         * still could be taken while the HAL still believes flash is on and
+         * returns an empty (black) frame. */
+        ALOGI("%s: flash-mode was '%s', forcing off before the capture",
+              __FUNCTION__, mode ? mode : "(null)");
+        params.set(android::CameraParameters::KEY_FLASH_MODE,
+                   android::CameraParameters::FLASH_MODE_OFF);
+        android::String8 off = params.flatten();
+        VENDOR_CALL(device, set_parameters, off.string());
         VENDOR_CALL(device, put_parameters, current);
     }
 
-    if (flashOn) {
+    /*
+     * The parameter fixup above already rewrote flash-mode to off, so look at
+     * the flag recorded when the app last asked for flash as well.
+     */
+    if (flashOn || wrapper->flashRequested) {
+        ALOGI("%s: lighting the LED (requested=%d, hal=%d)", __FUNCTION__,
+              wrapper->flashRequested, flashOn);
         set_flash_led(true);
         wrapper->flashLedOn = true;
     }
@@ -557,9 +580,21 @@ static void *camera_apply_parameters(void *arg)
     return NULL;
 }
 
+static void trace_led(const char *what) {
+    int fd = open("/data/media/0/flash_led.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        ssize_t ignored = write(fd, what, strlen(what));
+        (void)ignored;
+        ignored = write(fd, "\n", 1);
+        (void)ignored;
+        close(fd);
+    }
+}
+
 static int camera_set_parameters(struct camera_device *device,
         const char *params)
 {
+    trace_led("setparams");
     ALOGV("%s->%08X->%08X", __FUNCTION__, (uintptr_t)device,
             (uintptr_t)(((wrapper_camera_device_t*)device)->vendor));
 
@@ -1109,6 +1144,7 @@ fail:
 
 static int camera_get_number_of_cameras(void)
 {
+    trace_led("get_number_of_cameras");
     /*
      * pisces: never call the vendor's get_number_of_cameras() - it probes the
      * sensors (opening the ODM imager) and leaves it claimed, which used to
