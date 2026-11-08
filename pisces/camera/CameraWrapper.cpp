@@ -58,6 +58,8 @@ struct wrapper_camera_device_t {
     bool firstFocusWithFlash;
     bool previewStarted;
     bool activeFocusMove;
+    bool flashRequested;   // app asked for flash auto/on
+    bool flashLedOn;       // we are driving the torch LED for this capture
 
     camera_notify_callback notifyCallback;
     camera_data_callback dataCallback;
@@ -166,7 +168,7 @@ static char *camera_fixup_getparams(wrapper_camera_device_t *wrapper __attribute
     return strdup(strParams.string());
 }
 
-static char *camera_fixup_setparams(wrapper_camera_device_t *wrapper __attribute__((unused)),
+static char *camera_fixup_setparams(wrapper_camera_device_t *wrapper,
                                     const char *settings)
 {
     android::CameraParameters params;
@@ -180,8 +182,12 @@ static char *camera_fixup_setparams(wrapper_camera_device_t *wrapper __attribute
      * the photo is then exposed correctly instead of being black.
      */
     const char *flash = params.get(android::CameraParameters::KEY_FLASH_MODE);
-    if (flash != NULL && strcmp(flash, android::CameraParameters::FLASH_MODE_OFF) != 0) {
-        ALOGI("%s: forcing flash-mode off (requested '%s')", __FUNCTION__, flash);
+    ALOGI("%s: pisces flash-mode='%s'", __FUNCTION__, flash ? flash : "(null)");
+    wrapper->flashRequested = flash != NULL &&
+            strcmp(flash, android::CameraParameters::FLASH_MODE_OFF) != 0;
+    if (wrapper->flashRequested) {
+        ALOGI("%s: flash requested '%s' - HAL sees off, wrapper drives the LED",
+              __FUNCTION__, flash);
         params.set(android::CameraParameters::KEY_FLASH_MODE,
                    android::CameraParameters::FLASH_MODE_OFF);
     }
@@ -244,11 +250,36 @@ static void intercept_notify(int32_t msg_type,
     wrapper->notifyCallback(msg_type, ext1, ext2, wrapper->callbackUserData);
 }
 
+/*
+ * pisces: the 2013 HAL only arms the flash (LED current/timer through
+ * /dev/torch) and never triggers the strobe GPIO, so a capture taken with flash
+ * auto/on came back as an all-black frame.  The torch LED itself works: setting
+ * /sys/class/leds/flashlight/brightness to 255 raises the battery current by
+ * ~600 mA.  Drive it ourselves around the capture and keep handing the HAL
+ * flash-mode=off so the exposure is correct.
+ */
+static void set_flash_led(bool on) {
+    int fd = open("/sys/class/leds/flashlight/brightness", O_WRONLY);
+    if (fd < 0) {
+        ALOGE("%s: cannot open the flashlight node", __FUNCTION__);
+        return;
+    }
+    const char *value = on ? "255" : "0";
+    ssize_t written = write(fd, value, strlen(value));
+    close(fd);
+    ALOGI("%s: flashlight %s (%zd)", __FUNCTION__, on ? "on" : "off", written);
+}
+
 static void intercept_data(int32_t msg_type,
                            const camera_memory_t *data, unsigned int index,
                            camera_frame_metadata_t *metadata, void *user)
 {
-    toWrapper(user)->dataCallback(msg_type, data, index, metadata, toWrapper(user)->callbackUserData);
+    wrapper_camera_device_t *wrapper = toWrapper(user);
+    if (msg_type == CAMERA_MSG_COMPRESSED_IMAGE && wrapper->flashLedOn) {
+        set_flash_led(false);
+        wrapper->flashLedOn = false;
+    }
+    wrapper->dataCallback(msg_type, data, index, metadata, wrapper->callbackUserData);
 }
 
 static void intercept_dataTimestamp(int64_t timestamp,
@@ -453,36 +484,39 @@ static int camera_take_picture(struct camera_device *device)
     if (!device)
         return -EINVAL;
 
-    bool flashModeOn;
-    {
+    wrapper_camera_device_t *wrapper = toWrapper(device);
+
+    /*
+     * pisces: the flash is handled here rather than in set_parameters(),
+     * because apps often apply flash-mode once when the camera opens and the
+     * HAL keeps that state for the whole session.  Query the HAL right before
+     * the capture: if it thinks flash is on, switch it to off (so the still is
+     * exposed correctly) and light the torch LED ourselves for the shot.
+     */
+    bool flashOn = false;
+    char *current = VENDOR_CALL(device, get_parameters);
+    if (current != NULL) {
         android::CameraParameters params;
-        char *currentParams = VENDOR_CALL(device, get_parameters);
-        params.unflatten(android::String8(currentParams));
-        VENDOR_CALL(device, put_parameters, currentParams);
-        const char *flashMode = params.get(android::CameraParameters::KEY_FLASH_MODE);
-        flashModeOn = flashMode && strcmp(flashMode, android::CameraParameters::FLASH_MODE_OFF) != 0;
-    }
-
-    if (flashModeOn) {
-        if (!toWrapper(device)->firstFocusWithFlash) {
-            toWrapper(device)->firstFocusWithFlash = true;
-            // focus once to avoid black picture issue
-            VENDOR_CALL(device, cancel_auto_focus);
-            VENDOR_CALL(device, auto_focus);
-            VENDOR_CALL(device, stop_preview);
-            VENDOR_CALL(device, start_preview);
+        params.unflatten(android::String8(current));
+        const char *mode = params.get(android::CameraParameters::KEY_FLASH_MODE);
+        flashOn = mode != NULL && strcmp(mode, android::CameraParameters::FLASH_MODE_OFF) != 0;
+        if (flashOn) {
+            ALOGI("%s: flash-mode was '%s', switching the HAL to off and driving the LED",
+                  __FUNCTION__, mode);
+            params.set(android::CameraParameters::KEY_FLASH_MODE,
+                       android::CameraParameters::FLASH_MODE_OFF);
+            android::String8 off = params.flatten();
+            VENDOR_CALL(device, set_parameters, off.string());
         }
+        VENDOR_CALL(device, put_parameters, current);
     }
 
-    int ret = VENDOR_CALL(device, take_picture);
-
-    if (flashModeOn) {
-        // state messed up, restart preview to sync status and flush buffer
-        VENDOR_CALL(device, stop_preview);
-        VENDOR_CALL(device, start_preview);
+    if (flashOn) {
+        set_flash_led(true);
+        wrapper->flashLedOn = true;
     }
 
-    return ret;
+    return VENDOR_CALL(device, take_picture);
 }
 
 static int camera_cancel_picture(struct camera_device *device)
