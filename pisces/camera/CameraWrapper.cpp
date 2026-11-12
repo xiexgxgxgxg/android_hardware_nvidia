@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <utils/String8.h>
 #include <hardware/hardware.h>
 #include <hardware/camera.h>
@@ -60,6 +61,7 @@ struct wrapper_camera_device_t {
     bool activeFocusMove;
     bool flashRequested;   // app asked for flash auto/on
     bool flashLedOn;       // we are driving the torch LED for this capture
+    bool torchMode;        // flash-mode=torch: keep the LED on continuously
 
     camera_notify_callback notifyCallback;
     camera_data_callback dataCallback;
@@ -148,6 +150,9 @@ static camera_module_t *getVendorModule()
     return gVendorModule;
 }
 
+static void trace_led(const char *what);
+static void set_flash_led(bool on);
+
 static char *camera_fixup_getparams(wrapper_camera_device_t *wrapper __attribute__((unused)),
         const char *settings)
 {
@@ -161,10 +166,17 @@ static char *camera_fixup_getparams(wrapper_camera_device_t *wrapper __attribute
      * never fires).  Advertise "off" as the only flash mode so apps never ask
      * for a setting that would produce black photos.
      */
-    params.set(android::CameraParameters::KEY_FLASH_MODE,
-               android::CameraParameters::FLASH_MODE_OFF);
+    /*
+     * pisces: the wrapper drives the torch LED itself around the capture, so the
+     * usual modes can be offered again.  "torch" keeps the LED on until the app
+     * turns it off; "auto"/"on" light it just for the shot.
+     */
+    if (params.get(android::CameraParameters::KEY_FLASH_MODE) == NULL) {
+        params.set(android::CameraParameters::KEY_FLASH_MODE,
+                   android::CameraParameters::FLASH_MODE_OFF);
+    }
     params.set(android::CameraParameters::KEY_SUPPORTED_FLASH_MODES,
-               android::CameraParameters::FLASH_MODE_OFF);
+               "off,auto,on,torch");
 
 #ifdef LOG_PARAMETERS
     ALOGV("%s: Original parameters:", __FUNCTION__);
@@ -193,15 +205,39 @@ static char *camera_fixup_setparams(wrapper_camera_device_t *wrapper,
      * back as an all-black JPEG.  Until that is fixed, force the flash off:
      * the photo is then exposed correctly instead of being black.
      */
+    {
+        char line[160];
+        const char *rec_hint = params.get("recording-hint");
+        const char *video = params.get(android::CameraParameters::KEY_VIDEO_SIZE);
+        const char *preview = params.get(android::CameraParameters::KEY_PREVIEW_SIZE);
+        snprintf(line, sizeof(line), "setparams hint=%s video=%s preview=%s",
+                 rec_hint ? rec_hint : "-", video ? video : "-", preview ? preview : "-");
+        trace_led(line);
+    }
     const char *flash = params.get(android::CameraParameters::KEY_FLASH_MODE);
-    ALOGI("%s: pisces flash-mode='%s'", __FUNCTION__, flash ? flash : "(null)");
-    wrapper->flashRequested = flash != NULL &&
-            strcmp(flash, android::CameraParameters::FLASH_MODE_OFF) != 0;
-    if (wrapper->flashRequested) {
-        ALOGI("%s: flash requested '%s' - HAL sees off, wrapper drives the LED",
-              __FUNCTION__, flash);
-        params.set(android::CameraParameters::KEY_FLASH_MODE,
-                   android::CameraParameters::FLASH_MODE_OFF);
+    if (flash != NULL) {
+        const bool torch = strcmp(flash, "torch") == 0;
+        const bool off = strcmp(flash, android::CameraParameters::FLASH_MODE_OFF) == 0;
+        ALOGI("%s: pisces flash-mode='%s' (torch=%d off=%d)", __FUNCTION__, flash,
+              torch, off);
+        wrapper->torchMode = torch;
+        wrapper->flashRequested = !off;
+        if (torch) {
+            /* Continuous light: raise the LED now and leave it on. */
+            if (!wrapper->flashLedOn) {
+                set_flash_led(true);
+                wrapper->flashLedOn = true;
+            }
+        } else if (off && wrapper->flashLedOn) {
+            set_flash_led(false);
+            wrapper->flashLedOn = false;
+        }
+        if (wrapper->flashRequested) {
+            /* The HAL must keep seeing flash off: it would arm its own strobe
+             * and expose the still for a flash that never fires. */
+            params.set(android::CameraParameters::KEY_FLASH_MODE,
+                       android::CameraParameters::FLASH_MODE_OFF);
+        }
     }
 
 #ifdef LOG_PARAMETERS
@@ -290,7 +326,8 @@ static void intercept_data(int32_t msg_type,
                            camera_frame_metadata_t *metadata, void *user)
 {
     wrapper_camera_device_t *wrapper = toWrapper(user);
-    if (msg_type == CAMERA_MSG_COMPRESSED_IMAGE && wrapper->flashLedOn) {
+    if (msg_type == CAMERA_MSG_COMPRESSED_IMAGE && wrapper->flashLedOn
+            && !wrapper->torchMode) {
         set_flash_led(false);
         wrapper->flashLedOn = false;
     }
@@ -425,7 +462,9 @@ static int camera_start_recording(struct camera_device *device)
     if (!device)
         return EINVAL;
 
-    return VENDOR_CALL(device, start_recording);
+    int ret = VENDOR_CALL(device, start_recording);
+    trace_led("start_recording");
+    return ret;
 }
 
 static void camera_stop_recording(struct camera_device *device)
@@ -437,6 +476,7 @@ static void camera_stop_recording(struct camera_device *device)
         return;
 
     VENDOR_CALL(device, stop_recording);
+    trace_led("stop_recording");
 }
 
 static int camera_recording_enabled(struct camera_device *device)
@@ -532,11 +572,13 @@ static int camera_take_picture(struct camera_device *device)
      * The parameter fixup above already rewrote flash-mode to off, so look at
      * the flag recorded when the app last asked for flash as well.
      */
-    if (flashOn || wrapper->flashRequested) {
+    if (!wrapper->torchMode && (flashOn || wrapper->flashRequested)) {
         ALOGI("%s: lighting the LED (requested=%d, hal=%d)", __FUNCTION__,
               wrapper->flashRequested, flashOn);
         set_flash_led(true);
         wrapper->flashLedOn = true;
+    } else if (wrapper->torchMode) {
+        ALOGI("%s: torch mode, LED already on", __FUNCTION__);
     }
 
     return VENDOR_CALL(device, take_picture);
@@ -749,6 +791,17 @@ static void camera_release(struct camera_device *device)
     if (!device)
         return;
 
+    /* pisces: never leave the torch LED burning after the camera is released. */
+    {
+        wrapper_camera_device_t *wrapper = toWrapper(device);
+        if (wrapper->flashLedOn) {
+            set_flash_led(false);
+            wrapper->flashLedOn = false;
+        }
+        wrapper->torchMode = false;
+        wrapper->flashRequested = false;
+    }
+
     /* pisces: in restart mode the provider is killed by camera_device_close()
      * a few microseconds later, and the vendor release path costs seconds
      * (it waits for its own teardown timeouts).  The app's Camera.release()
@@ -870,7 +923,16 @@ static int camera_device_close(hw_device_t *device)
     if (wrapperProp("persist.pisces.camkill", 1)) {
         pid_t child = fork();
         if (child == 0) {
-            execl("/system/bin/sh", "sh", "-c", "kill -9 $PPID", (char *)NULL);
+            /* Kill the provider directly: exec'ing /system/bin/sh needs a
+             * shell_exec domain transition that hal_camera_default does not
+             * have, so the old "sh -c 'kill -9 $PPID'" silently failed and
+             * the provider kept its half-closed 2013 HAL state.  The next
+             * session (e.g. rear -> front -> rear) then reused a stale VI
+             * channel and froze. */
+            pid_t parent = getppid();
+            if (parent > 1) {
+                kill(parent, SIGKILL);
+            }
             _exit(0);
         }
         if (wrapper_dev->base.ops)

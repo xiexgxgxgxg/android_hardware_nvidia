@@ -46,6 +46,9 @@ cc_library_shared {
 // Spreadtrum RIL blob needs the pre-M libcutils socket_loopback_client().
 cc_library_shared {
     name: "libpisces_rilshim",
+    // rild is a vendor binary and its linker namespace cannot preload a
+    // /system/lib library, so this shim has to live in /vendor/lib.
+    vendor: true,
     srcs: [
         "rishim.c",
     ],

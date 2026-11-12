@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include <log/log.h>
+#include <cutils/properties.h>
 
 #include <hardware/audio.h>
 #include <hardware/hardware.h>
@@ -44,6 +45,30 @@
 
 #define PISCES_CARD         0
 #define PISCES_OUT_DEVICE   0
+
+/* pisces: PCM device used for the primary output.  Device 0 is the music
+ * link (tegra30-i2s.1 -> es325 port B -> DSP -> port D -> CS42L73 ASP),
+ * device 2 is the voice link (tegra30-i2s.0 -> es325 port C -> DSP -> port A
+ * -> CS42L73 VSP).  Keeping it switchable at runtime makes it possible to
+ * tell a broken music link from a dead codec/amplifier without reflashing:
+ *   setprop persist.pisces.audio_dev 2
+ * The DSP route is programmed accordingly (16 routes C<->A and B<->D). */
+#define PISCES_DSP_ROUTE_PASSTHROUGH 16
+
+static void mixer_set_int(struct mixer *mixer, const char *name, int value);
+
+static int pisces_pcm_device(void) {
+    return property_get_int32("persist.pisces.audio_dev", PISCES_OUT_DEVICE);
+}
+
+static void pisces_program_dsp_route(struct mixer *m, int pcm_dev) {
+    if (m == NULL) {
+        return;
+    }
+    if (pcm_dev != PISCES_OUT_DEVICE) {
+        mixer_set_int(m, "Internal Route Config", PISCES_DSP_ROUTE_PASSTHROUGH);
+    }
+}
 #define PISCES_IN_DEVICE    0
 
 #define PISCES_OUT_RATE     44100
@@ -107,7 +132,10 @@ static void mixer_set_int(struct mixer *mixer, const char *name, int value) {
     }
     if (mixer_ctl_set_value(ctl, 0, value) != 0) {
         ALOGW("cannot set '%s' to %d", name, value);
+        return;
     }
+    int readback = mixer_ctl_get_value(ctl, 0);
+    ALOGI("mixer '%s' = %d (wanted %d)", name, readback, value);
 }
 
 static void mixer_set_enum(struct mixer *mixer, const char *name, const char *value) {
@@ -152,7 +180,9 @@ static void pisces_set_speaker_route(struct pisces_audio_device *adev) {
     mixer_set_int(m, "Headphone Switch", 0);
     mixer_set_int(m, "Earpiece Switch", 0);
 
-    ALOGI("speaker route applied");
+
+    pisces_program_dsp_route(m, pisces_pcm_device());
+    ALOGI("speaker route applied (pcm dev %d)", pisces_pcm_device());
 }
 
 /* Headphone path: HPOUTA/HPOUTB <- HP Amp <- HL Left/Right DAC (the
@@ -172,7 +202,9 @@ static void pisces_set_headphone_route(struct pisces_audio_device *adev) {
     }
     mixer_set_int(m, "Headphone Switch", 1);
 
-    ALOGI("headphone route applied");
+
+    pisces_program_dsp_route(m, pisces_pcm_device());
+    ALOGI("headphone route applied (pcm dev %d)", pisces_pcm_device());
 }
 
 enum pisces_route {
@@ -180,15 +212,20 @@ enum pisces_route {
     PISCES_ROUTE_HEADPHONE = 1,
 };
 
-static void pisces_apply_route(struct pisces_audio_device *adev, int route) {
+/* force != 0 re-applies the mixer values even when the route did not change:
+ * the ES325 forgets its routing when it goes to sleep between streams (see
+ * es325_sleep() in the kernel driver), so every pcm_open() has to program it
+ * again. */
+static void pisces_apply_route_forced(struct pisces_audio_device *adev, int route, bool force) {
     pthread_mutex_lock(&adev->lock);
+    ALOGI("apply route %d (force=%d, mixer=%p)", route, force, adev->mixer);
     if (adev->mixer == NULL) {
         adev->mixer = mixer_open(PISCES_CARD);
         if (adev->mixer == NULL) {
             ALOGE("cannot open the mixer for card %d", PISCES_CARD);
         }
     }
-    if (adev->mixer != NULL && route != adev->route) {
+    if (adev->mixer != NULL && (force || route != adev->route)) {
         if (route == PISCES_ROUTE_HEADPHONE) {
             pisces_set_headphone_route(adev);
         } else {
@@ -197,6 +234,10 @@ static void pisces_apply_route(struct pisces_audio_device *adev, int route) {
         adev->route = route;
     }
     pthread_mutex_unlock(&adev->lock);
+}
+
+static void pisces_apply_route(struct pisces_audio_device *adev, int route) {
+    pisces_apply_route_forced(adev, route, false);
 }
 
 /*
@@ -336,7 +377,16 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer, si
 }
 
 static int out_open_pcm(struct pisces_stream_out *out) {
-    ALOGD("out_open_pcm(rate=%u)", out->sample_rate);
+    /* pisces: the debug property may be changed between streams; reopen the
+     * PCM when it points at a different device. */
+    static int opened_dev = PISCES_OUT_DEVICE;
+    int want_dev = pisces_pcm_device();
+    ALOGD("out_open_pcm(rate=%u, dev=%d)", out->sample_rate, want_dev);
+    if (out->pcm != NULL && want_dev != opened_dev) {
+        pcm_close(out->pcm);
+        out->pcm = NULL;
+    }
+    opened_dev = want_dev;
     struct pcm_config config = {
         .channels = PISCES_OUT_CHANNELS,
         .rate = out->sample_rate,
@@ -355,7 +405,7 @@ static int out_open_pcm(struct pisces_stream_out *out) {
      * writer then re-prepares it.  Without this the stream stayed in XRUN and
      * every later write went nowhere -> the audio stuttered after a few
      * seconds. */
-    out->pcm = pcm_open(PISCES_CARD, PISCES_OUT_DEVICE, PCM_OUT | PCM_NORESTART, &config);
+    out->pcm = pcm_open(PISCES_CARD, want_dev, PCM_OUT | PCM_NORESTART, &config);
     if (out->pcm == NULL || !pcm_is_ready(out->pcm)) {
         ALOGE("cannot open pcm: %s", out->pcm != NULL ? pcm_get_error(out->pcm) : "null");
         if (out->pcm != NULL) {
@@ -363,6 +413,15 @@ static int out_open_pcm(struct pisces_stream_out *out) {
             out->pcm = NULL;
         }
         return -EIO;
+    }
+
+    /* Re-program the codec/DSP route now that a stream really exists: the
+     * ES325 is put back to sleep (and its route forgotten) whenever the card
+     * goes idle, so the values set at adev_open_output_stream() are only
+     * valid until the first standby.  This is cheap (a handful of mixer
+     * writes) and is what actually makes the speaker/headphone audible. */
+    if (out->adev != NULL) {
+        pisces_apply_route_forced(out->adev, out->adev->route, true);
     }
     return 0;
 }
@@ -808,6 +867,7 @@ static int adev_open(const hw_module_t *module, const char *name, hw_device_t **
         ALOGE("cannot open the mixer for card %d", PISCES_CARD);
     } else {
         pisces_set_speaker_route(adev);
+        adev->route = PISCES_ROUTE_SPEAKER;
     }
 
     *device = &adev->device.common;
